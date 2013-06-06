@@ -17,7 +17,7 @@
         * jUnit in your Ant or Java classpath
 -->
 
-<project name="Connection Manager" default="all" basedir="..">
+<project name="Xiupitter Connection Manager" default="all" basedir="..">
 
     <description>
         Connection Manager build script.

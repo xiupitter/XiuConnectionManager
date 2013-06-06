@@ -14,12 +14,19 @@ package org.jivesoftware.multiplexer;
 import org.dom4j.Element;
 import org.jivesoftware.multiplexer.task.CloseSessionTask;
 import org.jivesoftware.multiplexer.task.DeliveryFailedTask;
+import com.xiupitter.task.NewSessionExTask;
 import org.jivesoftware.multiplexer.task.NewSessionTask;
 import org.jivesoftware.multiplexer.task.RouteTask;
 import org.jivesoftware.util.JiveGlobals;
 import org.jivesoftware.util.Log;
 
+import com.xiupitter.ServerInfo;
+import com.xiupitter.ServerManager;
+
 import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -77,15 +84,18 @@ public class ServerSurrogate {
      */
     Map<String, ConnectionWorkerThread> serverConnections =
             new ConcurrentHashMap<String, ConnectionWorkerThread>(0);
-
+    
+    Map<String,ThreadPoolExecutor > poolsMap = new HashMap<String,ThreadPoolExecutor>();
+    
     ServerSurrogate() {
     }
 
     void start() {
-        // Create empty thread pool
-        createThreadPool();
-        // Populate thread pool with threads that will include connections to the server
-        threadPool.prestartAllCoreThreads();
+    	
+    	List<ServerInfo>  servers = ServerManager.getInstance().getServers();
+    	for(ServerInfo server:servers){
+    		startNewPool(server);
+    	}
         // Start thread that will send heartbeats to the server every 30 seconds
         // to keep connections to the server open.
         Thread hearbeatThread = new Thread() {
@@ -111,6 +121,14 @@ public class ServerSurrogate {
         hearbeatThread.start();
     }
 
+    public void startNewPool(ServerInfo server){
+    	// Create empty thread pool
+		ThreadPoolExecutor t = createThreadPool(server);
+		poolsMap.put(server.toString(), t);
+		// Populate thread pool with threads that will include connections to the server
+		t.prestartAllCoreThreads();
+    }
+    
     /**
      * Closes existing connections to the server. A new thread pool will be created
      * but no connections will be created.  New connections will be created on demand.
@@ -134,13 +152,28 @@ public class ServerSurrogate {
         ClientSession.closeAll();
         // Shutdown the threads that send stanzas to the server
         if (now) {
-            threadPool.shutdownNow();
+        	for(ThreadPoolExecutor t:poolsMap.values()){
+        		t.shutdownNow();
+        	}
         }
         else {
-            threadPool.shutdown();
+        	for(ThreadPoolExecutor t:poolsMap.values()){
+        		t.shutdown();
+        	}
         }
     }
 
+   public void shutdown(String key,boolean now) {
+	   if(poolsMap.containsKey(key)){
+	        if (now) {
+	        	poolsMap.get(key).shutdownNow();
+	        }
+	        else {
+	        	poolsMap.get(key).shutdown();
+	        }
+	   }
+    }
+    
     /**
      * Notification message indication that a new client session has been created. Send
      * a notification to the main server.
@@ -149,9 +182,13 @@ public class ServerSurrogate {
      * @param address the remote address of the connection.
      */
     public void clientSessionCreated(final String streamID, final InetAddress address) {
-        threadPool.execute(new NewSessionTask(streamID, address));
+    	poolsMap.get(ServerManager.getInstance().getServerInfo(streamID).toString()).execute(new NewSessionTask(streamID, address));
     }
-
+    
+    public void clientSessionCreated(final String streamID, final String address,final String hostname) {
+    	poolsMap.get(ServerManager.getInstance().getServerInfo(streamID).toString()).execute(new NewSessionExTask(streamID, address,hostname));
+    }
+    
     /**
      * Notification message indication that a client session has been closed. Send
      * a notification to the main server.
@@ -159,7 +196,7 @@ public class ServerSurrogate {
      * @param streamID the stream ID assigned by the connection manager to the session.
      */
     public void clientSessionClosed(final String streamID) {
-        threadPool.execute(new CloseSessionTask(streamID));
+    	poolsMap.get(ServerManager.getInstance().getServerInfo(streamID).toString()).execute(new CloseSessionTask(streamID));
     }
 
     /**
@@ -171,7 +208,7 @@ public class ServerSurrogate {
      *        longer available session.
      */
     public void deliveryFailed(Element stanza, String streamID) {
-        threadPool.execute(new DeliveryFailedTask(streamID, stanza));
+    	poolsMap.get(ServerManager.getInstance().getServerInfo(streamID).toString()).execute(new DeliveryFailedTask(streamID, stanza));
     }
 
     /**
@@ -182,9 +219,8 @@ public class ServerSurrogate {
      * @param streamID the stream ID assigned by the connection manager to the session.
      */
     public void send(String stanza, String streamID) {
-        threadPool.execute(new RouteTask(streamID, stanza));
-    }
-
+    	poolsMap.get(ServerManager.getInstance().getServerInfo(streamID).toString()).execute(new RouteTask(streamID, stanza));
+    }    
     /**
      * Returns the SASL mechanisms supported by the server for client authentication.
      *
@@ -304,6 +340,25 @@ public class ServerSurrogate {
                 new ConnectionsWorkerFactory(), new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
+    private ThreadPoolExecutor  createThreadPool(ServerInfo info) {
+        int maxConnections = JiveGlobals.getIntProperty("xmpp.manager.connections", 5);
+        // Create a pool of threads that will process queued packets.
+        ThreadPoolExecutor threadPool = new ConnectionWorkerThreadPool(maxConnections, maxConnections, 60,
+                TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),
+                new ConnectionsWorkerFactory(info), new ThreadPoolExecutor.CallerRunsPolicy());
+        return threadPool;
+    }
+
+    public void shutdownPool(String key,boolean now){
+    	if(now){
+        	poolsMap.get(key).shutdownNow();
+    	}else{
+        	poolsMap.get(key).shutdown();
+    	}
+    	poolsMap.remove(key);
+    }
+    
+    
     /**
      * ThreadPoolExecutor that verifies connection status before executing a task. If
      * the connection is invalid then the worker thread will be dismissed and the task
@@ -356,17 +411,24 @@ public class ServerSurrogate {
         final ThreadGroup group;
         final AtomicInteger threadNumber = new AtomicInteger(1);
         final AtomicInteger failedAttempts = new AtomicInteger(0);
-
+        private ServerInfo info;
         ConnectionsWorkerFactory() {
             SecurityManager s = System.getSecurityManager();
             group = (s != null) ? s.getThreadGroup() :
                     Thread.currentThread().getThreadGroup();
         }
-
+        
+        ConnectionsWorkerFactory(ServerInfo info) {
+            SecurityManager s = System.getSecurityManager();
+            group = (s != null) ? s.getThreadGroup() :
+                    Thread.currentThread().getThreadGroup();
+            this.info = info;
+        }
+        
         public Thread newThread(Runnable r) {
             // Create new worker thread that will include a connection to the server
             ConnectionWorkerThread t = new ConnectionWorkerThread(group, r,
-                    "Connection Worker - " + threadNumber.getAndIncrement(), 0);
+                    "Connection Worker*"+info.getIp()+"- " + threadNumber.getAndIncrement(), 0,info);
             if (t.isDaemon())
                 t.setDaemon(false);
             if (t.getPriority() != Thread.NORM_PRIORITY)
@@ -374,10 +436,11 @@ public class ServerSurrogate {
             // Return null if failed to create worker thread
             if (!t.isValid()) {
                 int attempts = failedAttempts.incrementAndGet();
-                if (attempts == 2 && serverConnections.size() == 0) {
+                if (attempts == 2 ){//&& serverConnections.size() == 0) {
                     // Server seems to be unavailable so close existing client connections
-                    closeAll();
                     // Clean up the counter of failed attemps to create new connections
+                	ServerManager.getInstance().kickDeadServer(info);
+                	ServerSurrogate.this.shutdown(info.toString(), false);
                     failedAttempts.set(0);
                 }
                 return null;

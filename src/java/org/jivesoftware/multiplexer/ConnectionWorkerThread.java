@@ -11,6 +11,8 @@
 
 package org.jivesoftware.multiplexer;
 
+import com.xiupitter.ServerInfo;
+
 import com.jcraft.jzlib.JZlib;
 import com.jcraft.jzlib.ZInputStream;
 import org.dom4j.Element;
@@ -19,6 +21,7 @@ import org.jivesoftware.multiplexer.net.DNSUtil;
 import org.jivesoftware.multiplexer.net.MXParser;
 import org.jivesoftware.multiplexer.net.SocketConnection;
 import org.jivesoftware.multiplexer.spi.ServerFailoverDeliverer;
+import org.jivesoftware.multiplexer.spi.ServerFailoverSwitchDeliverer;
 import org.jivesoftware.util.JiveGlobals;
 import org.jivesoftware.util.LocaleUtils;
 import org.jivesoftware.util.Log;
@@ -96,7 +99,17 @@ public class ConnectionWorkerThread extends Thread {
         // Clean up features variable that is no longer needed
         features = null;
     }
-
+    
+    public ConnectionWorkerThread(ThreadGroup group, Runnable target, String name, long stackSize,ServerInfo info) {
+        super(group, target, name, stackSize);
+        ConnectionManager connectionManager = ConnectionManager.getInstance();
+        this.serverName = connectionManager.getServerName();
+        this.managerName = connectionManager.getName();
+        // Create connection to the server
+        createConnection(info);
+        // Clean up features variable that is no longer needed
+        features = null;
+    }
     /**
      * Returns true if there is a connection to the server that is still active. Note
      * that sometimes a socket assumes to be opened when in fact the underlying TCP
@@ -250,6 +263,114 @@ public class ConnectionWorkerThread extends Thread {
         return false;
     }
 
+    private boolean createConnection(ServerInfo info) {
+        int port =info.getPort();
+        Socket socket = new Socket();
+        String hostname =info.getIp();
+        // Use the specified hostname and port to connect to the server
+        try {
+            Log.debug("CM - Trying to connect to server at " + hostname + ":" + port);
+            // Establish a TCP connection to the Receiving Server
+            socket.connect(new InetSocketAddress(hostname, port), 20000);
+            Log.debug("CM - Plain connection to server at " + hostname + ":" + port + " successful");
+            System.out.println("CM - Plain connection to server at " + hostname + ":" + port + " successful");
+        } catch (IOException e) {
+            Log.error("Error trying to connect to server at " + hostname + ":" + port, e);
+            System.out.println("Error trying to connect to server at " + hostname + ":" + port);
+            return false;
+        }
+
+        try {
+            connection = new SocketConnection(new ServerFailoverSwitchDeliverer(), socket, false);
+
+            jidAddress = managerName + "/" + getName();
+
+            // Send the stream header
+            StringBuilder openingStream = new StringBuilder();
+            openingStream.append("<stream:stream");
+            openingStream.append(" xmlns:stream=\"http://etherx.jabber.org/streams\"");
+            openingStream.append(" xmlns=\"jabber:connectionmanager\"");
+            openingStream.append(" to=\"").append(jidAddress).append("\"");
+            openingStream.append(" version=\"1.0\">");
+            connection.deliverRawText(openingStream.toString());
+
+            // Set a read timeout (of 5 seconds) so we don't keep waiting forever
+            int soTimeout = socket.getSoTimeout();
+            socket.setSoTimeout(7000);
+
+            XMPPPacketReader reader = new XMPPPacketReader();
+            reader.getXPPParser().setInput(new InputStreamReader(socket.getInputStream(),
+                    CHARSET));
+            // Get the answer from the Receiving Server
+            XmlPullParser xpp = reader.getXPPParser();
+            for (int eventType = xpp.getEventType(); eventType != XmlPullParser.START_TAG;) {
+                eventType = xpp.next();
+            }
+
+            String id = xpp.getAttributeValue("", "id");
+            String serverVersion = xpp.getAttributeValue("", "version");
+
+            // Check if the remote server is XMPP 1.0 compliant
+            if (serverVersion != null && decodeVersion(serverVersion)[0] >= 1) {
+                // Get the stream features
+                features = reader.parseDocument().getRootElement();
+                // Check if there was an error
+                if (features != null && "error".equals(features.getName())) {
+                    Log.debug("CM - Error while opening stream: " + features.asXML());
+                    // Failed to secure the connection
+                    connection = null;
+                    return false;
+                }
+                // Check if TLS is enabled
+                if (features != null && features.element("starttls") != null) {
+                    // Try to secure the connection since the server supports TLS
+                    if (!secureConnection(reader, openingStream)) {
+                        // Failed to secure the connection
+                        connection = null;
+                        return false;
+                    }
+                }
+                if (features != null && features.element("compression") != null) {
+                    // Try to use stream compression since the server supports it
+                    if (!compressConnection(reader, openingStream)) {
+                        // Failed to use stream compression (when enabled locally)
+                        connection = null;
+                        return false;
+                    }
+                }
+                if (!doHandshake(id, reader)) {
+                    // Failed to authenticate with the server
+                    connection = null;
+                    return false;
+                }
+                // Add connection listener
+                connection.registerCloseListener(connectionListener, this);
+                // Set idle time out (server needs to send heartbeats or traffic). Default 5 minutes
+                connection.setIdleTimeout(5 * 60 * 1000);
+                // Create reader that will process packets sent from the server.
+                createSocketReader(reader);
+                // Restore default timeout
+                socket.setSoTimeout(soTimeout);
+                return true;
+            }
+            Log.debug("CM - Server does not support XMPP version 1.0 or later");
+        }
+        catch (SSLHandshakeException e) {
+            Log.warn("Handshake error while connecting to server: " + serverName +
+                    "(DNS lookup: " + info.getIp() + ":" + port + ")", e);
+        }
+        catch (Exception e) {
+            Log.error("Error while connecting to server: " + serverName + "(DNS lookup: " +
+                    info.getIp() + ":" + port + ")", e);
+        }
+        // Close the connection
+        if (connection != null) {
+            connection.close();
+            connection = null;
+        }
+        return false;
+    }
+    
     private boolean secureConnection(XMPPPacketReader reader, StringBuilder openingStream)
             throws Exception {
         Log.debug("CM - Indicating we want TLS to " + serverName);
@@ -416,7 +537,19 @@ public class ConnectionWorkerThread extends Thread {
         // Forward the notification to the server
         connection.deliver(sb.toString());
     }
-
+    
+    public void clientSessionCreated(String streamID, String address, String hostname) {
+        StringBuilder sb = new StringBuilder(100);
+        sb.append("<iq type='set' to='").append(serverName);
+        sb.append("' from='").append(jidAddress);
+        sb.append("' id='").append(String.valueOf(random.nextInt(1000) + "-" + sequence++));
+        sb.append("'><session xmlns='http://jabber.org/protocol/connectionmanager' id='").append(streamID);
+        sb.append("'><create><host name='").append(hostname);
+        sb.append("' address='").append(address).append("'/></create></session></iq>");
+        // Forward the notification to the server
+        connection.deliver(sb.toString());
+    }
+    
     /**
      * Sends a notification to the main server that a client session has been closed.
      *
@@ -451,7 +584,7 @@ public class ConnectionWorkerThread extends Thread {
         // Send notification to the server
         connection.deliver(sb.toString());
     }
-
+    
     public void run() {
         try {
             super.run();
@@ -465,6 +598,7 @@ public class ConnectionWorkerThread extends Thread {
             ConnectionManager.getInstance().getServerSurrogate().serverConnections.remove(getName());
             // Close the connection
             connection.close();
+            System.out.println("thread socket has shutdown connection:"+connection.getInetAddress());
         }
     }
 

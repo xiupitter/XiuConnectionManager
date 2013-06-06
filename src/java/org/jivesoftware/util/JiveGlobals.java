@@ -363,7 +363,22 @@ public class JiveGlobals {
 
         return values;
     }
+    
+    public static String[]  getXMLPropertiesx(String name) {
+        if (xmlProperties == null) {
+            loadSetupProperties();
+        }
 
+        // jiveHome not loaded?
+        if (xmlProperties == null) {
+            return new String[0];
+        }
+
+        String[] propNames = xmlProperties.getProperties(name);
+
+        return propNames;
+    }
+    
     /**
      * Returns an integer value Jive property. If the specified property doesn't exist, the
      * <tt>defaultValue</tt> will be returned.
@@ -464,5 +479,13 @@ public class JiveGlobals {
                 }
             }
         }
+    }
+    
+    public synchronized static void refrashSetupProperties() {
+    	xmlProperties=null;
+    }
+    
+    public static String getConfigurationPath(){
+    	return home + File.separator + getConfigName();
     }
 }

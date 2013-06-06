@@ -30,6 +30,9 @@ import org.jivesoftware.multiplexer.net.XMPPCodecFactory;
 import org.jivesoftware.multiplexer.net.http.HttpBindManager;
 import org.jivesoftware.util.*;
 
+import com.xiupitter.client.ClusterClient;
+import com.xiupitter.configuration.ClusterConfiguration;
+
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -106,7 +109,7 @@ public class ConnectionManager {
      */
     private File managerHome;
     protected ClassLoader loader;
-
+    private ClusterClient client;
     /**
      * True if in setup mode
      */
@@ -240,6 +243,12 @@ public class ConnectionManager {
     private void startModules() {
         serverSurrogate = new ServerSurrogate();
         serverSurrogate.start();
+        
+        if(ClusterConfiguration.isMasterEnable()){
+	        client = new ClusterClient();
+	        client.start();
+        }
+        
         String localIPAddress;
         // Setup port info
         try {

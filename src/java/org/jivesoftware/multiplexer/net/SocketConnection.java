@@ -11,6 +11,9 @@
 
 package org.jivesoftware.multiplexer.net;
 
+import com.xiupitter.ServerInfo;
+import com.xiupitter.ServerManager;
+
 import com.jcraft.jzlib.JZlib;
 import com.jcraft.jzlib.ZOutputStream;
 import org.dom4j.Element;
@@ -506,6 +509,11 @@ public class SocketConnection implements Connection {
 
     public void deliver(String stanza) {
         if (isClosed()) {
+        	//
+        	ServerInfo info = new ServerInfo(this.socket.getInetAddress().getHostAddress(),this.socket.getPort());
+        	ServerManager.getInstance().kickDeadServer(info);
+        	ConnectionManager.getInstance().getServerSurrogate().shutdown(info.toString(), false);
+
             XMPPPacketReader xmppReader = new XMPPPacketReader();
             xmppReader.setXPPFactory(factory);
             try {
@@ -538,6 +546,8 @@ public class SocketConnection implements Connection {
                 }
             }
             if (errorDelivering) {
+            	//
+            	ServerManager.getInstance().kickDeadServer(new ServerInfo(this.socket.getInetAddress().getHostAddress(),this.socket.getPort()));
                 close();
                 // Retry sending the packet again. Most probably if the packet is a
                 // Message it will be stored offline
@@ -581,6 +591,10 @@ public class SocketConnection implements Connection {
                 }
             }
             if (errorDelivering) {
+            	//
+            	ServerInfo info  = new ServerInfo(this.socket.getInetAddress().getHostAddress(),this.socket.getPort());
+            	ServerManager.getInstance().kickDeadServer(info);
+            	ConnectionManager.getInstance().getServerSurrogate().shutdown(info.toString(), false);
                 close();
             }
         }
